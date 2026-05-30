@@ -2,7 +2,7 @@
 
 import { Auth } from "@supabase/auth-ui-react";
 import { ThemeSupa } from "@supabase/auth-ui-shared";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { supabase } from "@/app/lib/supabase";
 
 interface Profile {
@@ -18,7 +18,8 @@ interface Message {
   to_user: string;
   title: string;
   message: string;
-  message_type: "normal" | "countdown" | "capsule" | "emotion" | "event" | "anonymous" | "burn";
+  // Eliminado 'countdown'
+  message_type: "normal" | "capsule" | "emotion" | "event" | "anonymous" | "burn";
   unlock_condition: string | null;
   unlock_at: string | null;
   anonymous_name: string | null;
@@ -35,6 +36,18 @@ type LockStatus = {
   isBurn: boolean;
 };
 
+// Componente para fallback de avatar (sin librerías)
+function AvatarFallback({ username, size = "w-10 h-10" }: { username: string; size?: string }) {
+  const initial = username?.[0]?.toUpperCase() || "?";
+  return (
+    <div
+      className={`${size} rounded-full bg-gradient-to-br from-neutral-700 to-neutral-900 flex items-center justify-center text-white font-mono text-sm border border-white/10`}
+    >
+      {initial}
+    </div>
+  );
+}
+
 export default function Home() {
   const [session, setSession] = useState<any>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -42,6 +55,8 @@ export default function Home() {
 
   const [username, setUsername] = useState("");
   const [bio, setBio] = useState("");
+  const [editingBio, setEditingBio] = useState(false);
+  const [newBio, setNewBio] = useState("");
   const [tab, setTab] = useState("messages");
   const [messageTab, setMessageTab] = useState("inbox");
   const [search, setSearch] = useState("");
@@ -50,19 +65,24 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeBurns, setActiveBurns] = useState<Set<number>>(new Set());
 
-  // Hora oficial del servidor (actualizada periódicamente para la UI)
   const [serverTime, setServerTime] = useState<Date | null>(null);
 
   const [showComposer, setShowComposer] = useState(false);
-  const [selectedUser, setSelectedUser] = useState("");
+  const [recipientInput, setRecipientInput] = useState("");
+  const [recipientUsername, setRecipientUsername] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newMessage, setNewMessage] = useState("");
   const [messageType, setMessageType] = useState<Message["message_type"]>("normal");
+  const [isSending, setIsSending] = useState(false);
 
-  const [timerOption, setTimerOption] = useState("1hour");
-  const [specificDate, setSpecificDate] = useState("");
+  // Eliminado timerOption (countdown)
+  const [capsuleDate, setCapsuleDate] = useState("");
+  const [capsuleTime, setCapsuleTime] = useState("");
   const [customCondition, setCustomCondition] = useState("");
   const [pseudonym, setPseudonym] = useState("");
+
+  const suggestionRef = useRef<HTMLDivElement>(null);
 
   // ==========================================
   // SESIÓN Y PERFIL
@@ -123,8 +143,19 @@ export default function Home() {
     fetchCoreData();
   }, [profile]);
 
+  // Cerrar sugerencias al hacer clic fuera
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (suggestionRef.current && !suggestionRef.current.contains(event.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
   // ==========================================
-  // OBTENER HORA OFICIAL DEL SERVIDOR (con tipado y comprobación)
+  // OBTENER HORA OFICIAL DEL SERVIDOR
   // ==========================================
   const fetchServerTime = async (): Promise<Date> => {
     try {
@@ -148,7 +179,6 @@ export default function Home() {
     return localNow;
   };
 
-  // Actualizar la hora del servidor cada 60 segundos (solo para UI)
   useEffect(() => {
     fetchServerTime();
     const interval = setInterval(fetchServerTime, 60000);
@@ -160,10 +190,10 @@ export default function Home() {
   }, []);
 
   // ==========================================
-  // LÓGICA DE DESBLOQUEO (usando serverTime para UI)
+  // LÓGICA DE DESBLOQUEO
   // ==========================================
   const getLockStatus = (msg: Message): LockStatus => {
-    const now = serverTime || new Date(); // fallback local mientras carga
+    const now = serverTime || new Date();
 
     if (msg.message_type === "burn" && msg.opened_at && !activeBurns.has(msg.id)) {
       return { locked: true, reason: "This message expired.", canUnlock: false, isBurn: true };
@@ -226,17 +256,26 @@ export default function Home() {
     m => m.to_user === profile?.username && m.is_public && !getLockStatus(m).locked && m.message_type !== "burn"
   );
 
-  const selectedProfile = users.find(u => u.username === selectedUser);
+  const selectedProfile = users.find(u => u.username === recipientUsername);
   const selectedUserPublicMessages = messages.filter(
-    m => m.to_user === selectedUser && m.is_public && !getLockStatus(m).locked && m.message_type !== "burn"
+    m => m.to_user === recipientUsername && m.is_public && !getLockStatus(m).locked && m.message_type !== "burn"
   );
 
-  const filteredUsers = users.filter(u =>
+  // Sugerencias para el compositor
+  const recipientSuggestions = users
+    .filter(u =>
+      u.username !== profile?.username &&
+      u.username.toLowerCase().includes(recipientInput.toLowerCase())
+    )
+    .slice(0, 5);
+
+  // Sugerencias para la pestaña search
+  const searchResults = users.filter(u =>
     u.username.toLowerCase().includes(search.toLowerCase()) && u.username !== profile?.username
   );
 
   // ==========================================
-  // ACCIONES DE ENVÍO (con hora fresca del servidor)
+  // ACCIONES
   // ==========================================
   const handleCreateProfile = async () => {
     if (!username.trim()) return alert("Username required.");
@@ -250,11 +289,35 @@ export default function Home() {
     if (!error) setProfile(newProfile);
   };
 
+  const handleSaveBio = async () => {
+    if (!profile) return;
+    const { error } = await supabase
+      .from("profiles")
+      .update({ bio: newBio })
+      .eq("id", profile.id);
+    if (error) {
+      alert(error.message);
+      return;
+    }
+    setProfile({ ...profile, bio: newBio });
+    setEditingBio(false);
+  };
+
   const handleSendMessage = async () => {
-    if (!selectedUser || !profile) return;
+    if (isSending) return;
+    if (!recipientUsername || !profile) return;
     if (!newTitle.trim() || !newMessage.trim()) return alert("Fill all fields.");
 
-    // Obtener la hora exacta del servidor en este momento (con tipado y comprobación)
+    const userExists = users.some(
+      (u) => u.username.toLowerCase() === recipientUsername.trim().toLowerCase()
+    );
+    if (!userExists) {
+      alert("User not found.");
+      return;
+    }
+
+    setIsSending(true);
+
     let baseTime: Date;
     try {
       const { data, error } = await supabase
@@ -270,25 +333,32 @@ export default function Home() {
       }
     } catch (err) {
       console.warn("Could not fetch server time, using local time", err);
-      baseTime = new Date(); // fallback local
+      baseTime = new Date();
     }
 
     let unlock_at: string | null = null;
-    let expires_at: string | null = null;
     let unlock_condition: string | null = null;
     let anonymous_name: string | null = null;
 
-    if (messageType === "countdown") {
-      let hours = 0;
-      if (timerOption === "1hour") hours = 1;
-      else if (timerOption === "1day") hours = 24;
-      else if (timerOption === "1week") hours = 168;
-      unlock_at = new Date(baseTime.getTime() + hours * 60 * 60 * 1000).toISOString();
-    } else if (messageType === "capsule") {
-      if (specificDate) {
-        // Guardamos la fecha específica (se interpreta en la zona local del navegador,
-        // pero se almacena como UTC). Es responsabilidad del usuario elegir bien.
-        unlock_at = new Date(specificDate).toISOString();
+    // Eliminado countdown
+    if (messageType === "capsule") {
+      if (capsuleDate && capsuleTime) {
+        const combined = new Date(`${capsuleDate}T${capsuleTime}`);
+        if (isNaN(combined.getTime())) {
+          alert("Invalid date or time");
+          setIsSending(false);
+          return;
+        }
+        if (combined <= baseTime) {
+          alert("The capsule date must be in the future.");
+          setIsSending(false);
+          return;
+        }
+        unlock_at = combined.toISOString();
+      } else {
+        alert("Please select both date and time for the time capsule");
+        setIsSending(false);
+        return;
       }
     } else if (messageType === "emotion" || messageType === "event") {
       unlock_condition = customCondition.trim() || "When the moment is right";
@@ -298,14 +368,14 @@ export default function Home() {
 
     const newMessagePayload = {
       from_user: profile.username,
-      to_user: selectedUser,
+      to_user: recipientUsername,
       title: newTitle,
       message: newMessage,
       message_type: messageType,
       unlock_condition,
       unlock_at,
       anonymous_name,
-      expires_at,
+      expires_at: null,
       is_public: false,
       opened_at: null,
     };
@@ -314,14 +384,20 @@ export default function Home() {
 
     if (!error && data) {
       setMessages([data[0], ...messages]);
+      // Resetear formulario
       setNewTitle("");
       setNewMessage("");
       setCustomCondition("");
       setPseudonym("");
+      setCapsuleDate("");
+      setCapsuleTime("");
+      setRecipientInput("");
+      setRecipientUsername("");
       setShowComposer(false);
     } else {
       alert("Error sending message: " + error?.message);
     }
+    setIsSending(false);
   };
 
   const toggleMessagePublicity = async (messageId: number, currentStatus: boolean) => {
@@ -341,8 +417,8 @@ export default function Home() {
   // ==========================================
   if (!session) {
     return (
-      <main className="bg-black text-neutral-100 min-h-screen flex items-center justify-center font-sans">
-        <div className="w-[380px] border border-white/5 p-8 rounded-3xl bg-neutral-950/50 backdrop-blur-md">
+      <main className="bg-black text-neutral-100 min-h-screen flex items-center justify-center font-sans p-4">
+        <div className="w-full max-w-[380px] border border-white/5 p-8 rounded-3xl bg-neutral-950/50 backdrop-blur-md">
           <h1 className="text-4xl font-light mb-2 text-center tracking-[0.3em] text-white">AFTERLOOM</h1>
           <p className="text-xs text-neutral-500 text-center mb-8 tracking-wider">Messages tied to moments.</p>
           <Auth supabaseClient={supabase} appearance={{ theme: ThemeSupa }} providers={["google"]} theme="dark" />
@@ -353,7 +429,7 @@ export default function Home() {
 
   if (loadingProfile) {
     return (
-      <main className="bg-black text-neutral-400 min-h-screen flex items-center justify-center font-mono text-xs tracking-widest animate-pulse">
+      <main className="bg-black text-neutral-400 min-h-screen flex items-center justify-center font-mono text-xs tracking-widest animate-pulse p-4">
         Loading...
       </main>
     );
@@ -362,7 +438,7 @@ export default function Home() {
   if (session && !profile) {
     return (
       <main className="bg-black text-white min-h-screen flex items-center justify-center p-4">
-        <div className="w-[380px] flex flex-col gap-5 bg-neutral-950 border border-white/10 p-8 rounded-3xl">
+        <div className="w-full max-w-[380px] flex flex-col gap-5 bg-neutral-950 border border-white/10 p-8 rounded-3xl">
           <h1 className="text-2xl font-light tracking-widest text-center">Create Profile</h1>
           <p className="text-xs text-neutral-500 text-center -mt-2">Choose your username.</p>
           <input
@@ -390,14 +466,14 @@ export default function Home() {
   }
 
   // ==========================================
-  // RENDER PRINCIPAL (completo y sin errores)
+  // RENDER PRINCIPAL (RESPONSIVE)
   // ==========================================
   return (
     <main className="relative bg-black text-neutral-200 min-h-screen flex flex-col items-center overflow-x-hidden selection:bg-white selection:text-black">
       <div className="absolute w-[600px] h-[600px] bg-neutral-800/10 rounded-full blur-[160px] -top-40 pointer-events-none"></div>
 
-      <header className="relative z-10 text-center mt-16">
-        <h1 className="text-6xl font-extralight tracking-[0.4em] text-white cursor-pointer" onClick={() => setTab("messages")}>
+      <header className="relative z-10 text-center mt-16 px-4">
+        <h1 className="text-5xl md:text-6xl font-extralight tracking-[0.2em] md:tracking-[0.4em] text-white cursor-pointer" onClick={() => setTab("messages")}>
           AFTERLOOM
         </h1>
         <p className="text-xs font-mono text-neutral-500 tracking-[0.2em] mt-3 uppercase">
@@ -405,9 +481,9 @@ export default function Home() {
         </p>
       </header>
 
-      {/* ========== TABLA DE MENSAJES ========== */}
+      {/* ========== MENSAJES ========== */}
       {tab === "messages" && (
-        <div className="relative z-10 mt-12 flex flex-col items-center pb-40 w-full max-w-xl px-4">
+        <div className="relative z-10 mt-12 flex flex-col items-center pb-40 w-full max-w-3xl px-4">
           <div className="flex gap-8 mb-10 border-b border-white/5 w-full justify-center pb-4">
             <button
               onClick={() => setMessageTab("inbox")}
@@ -432,22 +508,63 @@ export default function Home() {
             </button>
           )}
 
-          {/* COMPOSER */}
+          {/* COMPOSER MEJORADO */}
           {showComposer && (
-            <div className="w-full flex flex-col gap-4 mb-10 bg-neutral-950 p-6 rounded-2xl border border-white/5 backdrop-blur-xl animate-fadeIn">
+            <div className="w-full flex flex-col gap-4 mb-10 bg-neutral-950 p-6 rounded-2xl border border-white/5 backdrop-blur-xl">
               <label className="text-xs font-mono text-neutral-500 tracking-wider">Recipient</label>
-              <select
-                value={selectedUser}
-                onChange={(e) => setSelectedUser(e.target.value)}
-                className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm text-white font-mono"
-              >
-                <option value="">Choose user...</option>
-                {users.filter(u => u.username !== profile?.username).map((u, i) => (
-                  <option key={i} value={u.username}>@{u.username}</option>
-                ))}
-              </select>
+              <div className="relative" ref={suggestionRef}>
+                <input
+                  type="text"
+                  placeholder="Type username..."
+                  value={recipientInput}
+                  onChange={(e) => {
+                    setRecipientInput(e.target.value);
+                    setShowSuggestions(true);
+                    if (e.target.value === "") setRecipientUsername("");
+                  }}
+                  onFocus={() => setShowSuggestions(true)}
+                  className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm text-white w-full"
+                />
+                {showSuggestions && recipientSuggestions.length > 0 && (
+                  <div className="absolute z-20 mt-1 w-full bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden shadow-xl">
+                    {recipientSuggestions.map((user) => (
+                      <button
+                        key={user.id}
+                        type="button"
+                        onClick={() => {
+                          setRecipientUsername(user.username);
+                          setRecipientInput(user.username);
+                          setShowSuggestions(false);
+                        }}
+                        className="flex items-center gap-3 p-3 w-full hover:bg-neutral-800 transition-colors text-left"
+                      >
+                        {user.avatar_url ? (
+                          <img
+                            src={user.avatar_url}
+                            alt={user.username}
+                            className="w-10 h-10 rounded-full object-cover border border-white/10"
+                            onError={(e) => (e.currentTarget.style.display = "none")}
+                          />
+                        ) : (
+                          <AvatarFallback username={user.username} size="w-10 h-10" />
+                        )}
+                        <div>
+                          <p className="text-white font-medium">@{user.username}</p>
+                          <p className="text-xs text-neutral-500 line-clamp-1">{user.bio || "No bio yet."}</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
 
-              
+              {/* Mostrar destinatario seleccionado con claridad */}
+              {recipientUsername && (
+                <div className="flex items-center gap-2 mt-1 text-xs text-neutral-400">
+                  <span>✓ To:</span>
+                  <span className="text-white font-mono">@{recipientUsername}</span>
+                </div>
+              )}
 
               <label className="text-xs font-mono text-neutral-500 tracking-wider mt-2">Message Type</label>
               <select
@@ -455,54 +572,31 @@ export default function Home() {
                 onChange={(e) => setMessageType(e.target.value as Message["message_type"])}
                 className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm text-white font-mono"
               >
-                <option value="normal">
-  Normal Message (Permanent)
-</option>
-
-<option value="countdown">
-  Countdown Message (Opens Later)
-</option>
-
-<option value="capsule">
-  Time Capsule (Opens on Date)
-</option>
-
-<option value="emotion">
-  Emotional Trigger (Open When Ready)
-</option>
-
-<option value="event">
-  Event Message (Life Moment)
-</option>
-
-<option value="anonymous">
-  Anonymous Message (Hidden Identity)
-</option>
-
-<option value="burn">
-  Burn After Reading (Disappears Forever)
-</option>
+                <option value="normal">Normal Message (Permanent)</option>
+                <option value="capsule">Time Capsule (Opens on Date)</option>
+                <option value="emotion">Emotional Trigger (Open When Ready)</option>
+                <option value="event">Event Message (Life Moment)</option>
+                <option value="anonymous">Anonymous Message (Hidden Identity)</option>
+                <option value="burn">Burn After Reading (Disappears Forever)</option>
               </select>
 
-              {messageType === "countdown" && (
-                <select
-                  value={timerOption}
-                  onChange={(e) => setTimerOption(e.target.value)}
-                  className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm font-mono text-white"
-                >
-                  <option value="1hour">Opens in 1 Hour</option>
-                  <option value="1day">Opens in 1 Day</option>
-                  <option value="1week">Opens in 1 Week</option>
-                </select>
-              )}
+              {/* Eliminado bloque de countdown */}
 
               {messageType === "capsule" && (
-                <input
-                  type="datetime-local"
-                  value={specificDate}
-                  onChange={(e) => setSpecificDate(e.target.value)}
-                  className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm font-mono text-white"
-                />
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="date"
+                    value={capsuleDate}
+                    onChange={(e) => setCapsuleDate(e.target.value)}
+                    className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm font-mono text-white flex-1"
+                  />
+                  <input
+                    type="time"
+                    value={capsuleTime}
+                    onChange={(e) => setCapsuleTime(e.target.value)}
+                    className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm font-mono text-white flex-1"
+                  />
+                </div>
               )}
 
               {(messageType === "emotion" || messageType === "event") && (
@@ -524,6 +618,7 @@ export default function Home() {
                   className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none text-sm font-mono text-neutral-300"
                 />
               )}
+
               <input
                 type="text"
                 placeholder="Message title..."
@@ -533,7 +628,7 @@ export default function Home() {
               />
 
               <textarea
-                placeholder="Write your message. This message cannot be edited or erased."
+                placeholder="Write your message. This cannot be edited or erased."
                 value={newMessage}
                 onChange={(e) => setNewMessage(e.target.value)}
                 className="bg-black border border-neutral-800 rounded-xl px-4 py-3 outline-none h-40 resize-none text-sm leading-relaxed"
@@ -541,14 +636,15 @@ export default function Home() {
 
               <button
                 onClick={handleSendMessage}
-                className="bg-white text-black font-semibold tracking-widest uppercase text-xs py-3.5 rounded-xl hover:bg-neutral-200 transition mt-4"
+                disabled={isSending}
+                className="bg-white text-black font-semibold tracking-widest uppercase text-xs py-3.5 rounded-xl hover:bg-neutral-200 transition mt-4 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Send Message
+                {isSending ? "SENDING..." : "SEND MESSAGE"}
               </button>
             </div>
           )}
 
-          {/* LISTADO DE TARJETAS */}
+          {/* LISTADO DE MENSAJES */}
           <div className="flex flex-col gap-6 w-full">
             {(messageTab === "inbox" ? filteredInboxMessages : sentMessages).map((msg) => {
               const lock = getLockStatus(msg);
@@ -559,7 +655,7 @@ export default function Home() {
 
               return (
                 <div key={msg.id} className="w-full bg-neutral-950/40 p-6 rounded-2xl border border-white/5 flex flex-col gap-2 relative group">
-                  <div className="flex justify-between items-center text-xs font-mono text-neutral-500">
+                  <div className="flex justify-between items-center text-xs font-mono text-neutral-500 flex-wrap gap-2">
                     <span>{messageTab === "inbox" ? `FROM: ${senderDisplay}` : `TO: @${msg.to_user}`}</span>
                     <span className="bg-neutral-900 px-2 py-0.5 rounded text-[10px] tracking-wider uppercase text-neutral-400 flex items-center gap-1">
                       {msg.message_type}
@@ -591,12 +687,12 @@ export default function Home() {
                     </div>
                   )}
 
-                  <div className="flex justify-between items-center text-[11px] font-mono text-neutral-600 pt-2 border-t border-white/5">
+                  <div className="flex justify-between items-center text-[11px] font-mono text-neutral-600 pt-2 border-t border-white/5 flex-wrap gap-2">
                     <span>{new Date(msg.created_at).toLocaleDateString()}</span>
                     {messageTab === "inbox" && !lock.locked && msg.message_type !== "burn" && (
                       <button
                         onClick={() => toggleMessagePublicity(msg.id, msg.is_public)}
-                        className={`px-3 py-1 rounded-md transition ${msg.is_public ? "bg-white text-black font-semibold" : "border border-neutral-800 text-neutral-400 hover:border-neutral-500"}`}
+                        className={`px-3 py-1 rounded-md transition text-xs ${msg.is_public ? "bg-white text-black font-semibold" : "border border-neutral-800 text-neutral-400 hover:border-neutral-500"}`}
                       >
                         {msg.is_public ? "Added to Profile" : "Add to Profile"}
                       </button>
@@ -612,9 +708,9 @@ export default function Home() {
         </div>
       )}
 
-      {/* ========== BÚSQUEDA ========== */}
+      {/* ========== BÚSQUEDA MEJORADA ========== */}
       {tab === "search" && (
-        <div className="relative z-10 mt-12 flex flex-col items-center pb-40 w-full max-w-md px-4">
+        <div className="relative z-10 mt-12 flex flex-col items-center pb-40 w-full max-w-xl px-4">
           <input
             type="text"
             placeholder="Search users..."
@@ -623,34 +719,95 @@ export default function Home() {
             className="w-full bg-neutral-950 border border-white/5 rounded-xl px-5 py-3.5 outline-none font-mono text-sm"
           />
           <div className="mt-8 flex flex-col gap-4 w-full">
-            {filteredUsers.map((u, index) => (
+            {searchResults.map((user) => (
               <div
-                key={index}
+                key={user.id}
                 onClick={() => {
-                  setSelectedUser(u.username);
+                  setRecipientUsername(user.username);
+                  setRecipientInput(user.username);
                   setTab("userProfile");
                 }}
-                className="w-full border border-white/5 rounded-2xl p-5 bg-neutral-950/60 cursor-pointer hover:border-neutral-700 transition flex justify-between items-center"
+                className="w-full border border-white/5 rounded-2xl p-5 bg-neutral-950/60 cursor-pointer hover:border-neutral-700 transition flex items-center gap-4"
               >
-                <div>
-                  <p className="font-medium text-white">@{u.username}</p>
-                  <p className="text-neutral-500 text-xs mt-1 line-clamp-1 italic">{u.bio || "No bio yet."}</p>
+                {user.avatar_url ? (
+                  <img
+                    src={user.avatar_url}
+                    alt={user.username}
+                    className="w-14 h-14 rounded-full object-cover border border-white/10"
+                    onError={(e) => (e.currentTarget.style.display = "none")}
+                  />
+                ) : (
+                  <AvatarFallback username={user.username} size="w-14 h-14" />
+                )}
+                <div className="flex-1">
+                  <p className="font-medium text-white">@{user.username}</p>
+                  <p className="text-neutral-500 text-xs mt-1 line-clamp-2 italic">{user.bio || "No bio yet."}</p>
                 </div>
-                <span className="text-neutral-600 font-mono text-xs">View Profile →</span>
+                <span className="text-neutral-600 font-mono text-xs">View →</span>
               </div>
             ))}
+            {searchResults.length === 0 && search.length > 0 && (
+              <p className="text-neutral-600 text-center text-sm mt-8">No users found.</p>
+            )}
           </div>
         </div>
       )}
 
-      {/* ========== PERFIL PROPIO ========== */}
+      {/* ========== PERFIL PROPIO (EDITAR PERFIL MEJORADO VISUALMENTE) ========== */}
       {tab === "profile" && (
         <div className="relative z-10 mt-12 w-full max-w-xl flex flex-col items-center pb-40 px-4">
-          {profile?.avatar_url && (
-            <img src={profile.avatar_url} alt="avatar" className="w-20 h-20 rounded-full grayscale border border-white/10" />
+          {profile?.avatar_url ? (
+            <img
+              src={profile.avatar_url}
+              alt="avatar"
+              className="w-24 h-24 rounded-full grayscale border border-white/10 object-cover"
+              onError={(e) => (e.currentTarget.style.display = "none")}
+            />
+          ) : (
+            <AvatarFallback username={profile?.username || "U"} size="w-24 h-24" />
           )}
           <h2 className="text-2xl font-light mt-4 text-white tracking-widest">@{profile?.username}</h2>
-          <p className="text-sm text-neutral-400 mt-2 text-center italic max-w-sm font-light">"{profile?.bio || "No bio yet."}"</p>
+
+          {/* Botón Edit Profile más elegante */}
+          <button
+            onClick={() => {
+              setNewBio(profile?.bio || "");
+              setEditingBio(true);
+            }}
+            className="mt-4 flex items-center gap-2 border border-neutral-700/50 bg-neutral-900/30 backdrop-blur-sm px-5 py-2 rounded-full text-xs font-mono tracking-wider hover:bg-neutral-800/50 transition"
+          >
+            <span>✎</span> Edit Profile
+          </button>
+
+          {editingBio ? (
+            <div className="w-full mt-6">
+              <textarea
+                value={newBio}
+                onChange={(e) => setNewBio(e.target.value)}
+                rows={3}
+                className="w-full bg-black border border-neutral-800 rounded-xl px-4 py-3 text-sm text-white resize-none focus:outline-none focus:border-neutral-500"
+                placeholder="Write your bio..."
+              />
+              <div className="flex gap-3 mt-3 justify-center">
+                <button
+                  onClick={handleSaveBio}
+                  className="px-5 py-2 bg-white text-black rounded-full text-xs font-semibold tracking-wider hover:bg-neutral-200 transition"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => setEditingBio(false)}
+                  className="px-5 py-2 border border-neutral-800 rounded-full text-xs font-mono hover:border-neutral-500 transition"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-neutral-400 mt-4 text-center italic max-w-sm font-light">
+              "{profile?.bio || "No bio yet."}"
+            </p>
+          )}
 
           <div className="mt-12 flex flex-col gap-6 w-full">
             <div className="border-b border-neutral-800 pb-2 flex justify-between items-center">
@@ -684,15 +841,24 @@ export default function Home() {
       {/* ========== PERFIL AJENO ========== */}
       {tab === "userProfile" && (
         <div className="relative z-10 mt-12 flex flex-col items-center pb-40 w-full max-w-xl px-4">
-          {selectedProfile?.avatar_url && (
-            <img src={selectedProfile.avatar_url} alt="avatar" className="w-20 h-20 rounded-full grayscale border border-white/10" />
+          {selectedProfile?.avatar_url ? (
+            <img
+              src={selectedProfile.avatar_url}
+              alt="avatar"
+              className="w-24 h-24 rounded-full grayscale border border-white/10 object-cover"
+              onError={(e) => (e.currentTarget.style.display = "none")}
+            />
+          ) : (
+            <AvatarFallback username={recipientUsername || "U"} size="w-24 h-24" />
           )}
-          <h2 className="text-2xl font-light mt-4 text-white tracking-widest">@{selectedUser}</h2>
-          <p className="text-sm text-neutral-400 mt-2 text-center italic max-w-sm font-light">"{selectedProfile?.bio || "No manifesto."}"</p>
+          <h2 className="text-2xl font-light mt-4 text-white tracking-widest">@{recipientUsername}</h2>
+          <p className="text-sm text-neutral-400 mt-4 text-center italic max-w-sm font-light">
+            "{selectedProfile?.bio || "No bio yet."}"
+          </p>
 
           <div className="mt-12 flex flex-col gap-6 w-full">
             <div className="border-b border-neutral-800 pb-2 flex justify-between items-center">
-              <h3 className="text-xs uppercase font-mono tracking-widest text-neutral-400">Public Messages of @{selectedUser}</h3>
+              <h3 className="text-xs uppercase font-mono tracking-widest text-neutral-400">Public Messages</h3>
               <span className="text-[10px] font-mono text-neutral-600">{selectedUserPublicMessages.length} messages</span>
             </div>
             {selectedUserPublicMessages.map((msg) => (
@@ -712,9 +878,9 @@ export default function Home() {
         </div>
       )}
 
-      {/* BARRA DE NAVEGACIÓN */}
-      <div className="fixed bottom-0 left-0 w-full flex justify-center pb-8 z-20">
-        <div className="bg-neutral-950/80 backdrop-blur-md border border-white/5 rounded-full px-8 py-3.5 flex gap-10 shadow-2xl">
+      {/* BARRA DE NAVEGACIÓN RESPONSIVE */}
+      <div className="fixed bottom-0 left-0 w-full flex justify-center pb-6 md:pb-8 z-20">
+        <div className="bg-neutral-950/80 backdrop-blur-md border border-white/5 rounded-full px-6 py-3 md:px-8 md:py-3.5 flex gap-6 md:gap-10 shadow-2xl">
           {["messages", "search", "profile"].map((t) => (
             <button
               key={t}
